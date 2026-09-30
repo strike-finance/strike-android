@@ -19,23 +19,42 @@ Run workflow. Each run:
 therefore always serves the current build. The web app's Mobile Login page and
 the landing page link to that URL.
 
-## One-time setup: the Play service account
+Run the workflow with **rehearse** ticked to download and verify the live
+version without publishing anything. It's useful after changing the key or the
+Play permissions.
 
-The workflow reads the `PLAY_SERVICE_ACCOUNT_JSON` secret.
+## How the Play key is protected
 
-1. Google Cloud console, in the project linked under Play Console → Setup → API
-   access: go to IAM & Admin → Service accounts → Create, then Keys → Add key →
-   JSON.
-2. Play Console → Users and permissions → Invite new users, using the service
-   account's email. Under App permissions, add Strike Finance with:
-   - View app information (read-only)
-   - Release to production, exclude devices, and use Play App Signing. This is
-     needed to download Play-signed APKs; the workflow never changes a release.
-3. Add the key to this repo:
-   `gh secret set PLAY_SERVICE_ACCOUNT_JSON --repo strike-finance/strike-android < key.json`,
-   then delete `key.json`.
-4. Run the workflow once by hand and check that it either publishes the live
-   version or reports that it's already released.
+- The key is the `PLAY_SERVICE_ACCOUNT_JSON` secret in the **`play`**
+  environment. Only `main` may use that environment, so a workflow pushed on
+  any other branch gets nothing.
+- `main` is covered by a ruleset: changes need a pull request approved by the
+  code owner (`.github/CODEOWNERS`), and it can't be force-pushed or deleted.
+  Repository admins can bypass it.
+- Releases are immutable. Once published, a release's APK and tag can't be
+  replaced.
+- The script uses only Python's standard library and the runner's `openssl`,
+  so no third-party package runs next to the key. `actions/checkout` is pinned
+  to a commit SHA.
+
+## The Play service account
+
+`apk-sync@strike-play-api.iam.gserviceaccount.com`, in the Google Cloud project
+`strike-play-api`. It needs no Cloud IAM roles. In Play Console → Users and
+permissions it has access to the Strike Finance app only, with:
+
+- View app information (read-only)
+- Release to production, exclude devices, and use Play App Signing. Downloading
+  Play-signed APKs is part of Play App Signing. Nothing in this repo creates or
+  changes a release.
+
+### Rotating the key
+
+1. Google Cloud → IAM & Admin → Service accounts → `apk-sync` → Keys → Add key
+   → JSON.
+2. `gh secret set PLAY_SERVICE_ACCOUNT_JSON --env play --repo strike-finance/strike-android < key.json && rm key.json`
+3. Run the workflow with **rehearse** ticked and check that it passes.
+4. Delete the old key on the same Keys page.
 
 A new Play Console permission can take up to a day to reach the API. Until it
 does, runs fail with 401/403.

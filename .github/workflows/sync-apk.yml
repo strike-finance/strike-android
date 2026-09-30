@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      rehearse:
+        description: Download and verify the live version even if it is already released, without publishing
+        type: boolean
+        default: false
 
 permissions:
   contents: write # create releases
@@ -23,28 +28,32 @@ env:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # The Play key lives in this environment, which only main can use. A
+    # workflow pushed on any other branch can't read it.
+    environment:
+      name: play
+      deployment: false
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
-
-      - run: pip install -r scripts/requirements.txt
+          persist-credentials: false
 
       - name: Find the live production version
         id: play
         env:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
-        run: python scripts/play_apk.py latest >> "$GITHUB_OUTPUT"
+        run: python3 scripts/play_apk.py latest >> "$GITHUB_OUTPUT"
 
       - name: Skip if that version is already released
         id: known
         run: |
           code='${{ steps.play.outputs.version_code }}'
-          if gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -qx "v[^-]*-${code}"; then
+          if [ '${{ inputs.rehearse }}' = 'true' ]; then
+            echo "Rehearsal: downloading and verifying version code ${code}; nothing will be published"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          elif gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' | grep -qx "v[^-]*-${code}"; then
             echo "Version code ${code} is already released"
             echo "released=true" >> "$GITHUB_OUTPUT"
           else
@@ -55,7 +64,7 @@ jobs:
         if: steps.known.outputs.released == 'false'
         env:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
-        run: python scripts/play_apk.py download '${{ steps.play.outputs.version_code }}' strike.apk
+        run: python3 scripts/play_apk.py download '${{ steps.play.outputs.version_code }}' strike.apk
 
       - name: Verify package, version and signature
         if: steps.known.outputs.released == 'false'
@@ -77,9 +86,11 @@ jobs:
           echo "sha256=$(sha256sum strike.apk | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Publish the release
-        if: steps.known.outputs.released == 'false'
+        if: steps.known.outputs.released == 'false' && inputs.rehearse != true
         run: |
           gh release create "v${{ steps.apk.outputs.name }}-${{ steps.apk.outputs.code }}" strike.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "Strike ${{ steps.apk.outputs.name }} (${{ steps.apk.outputs.code }})" \
             --latest \
             --notes "The same build that is live on Google Play, as a single APK for phones without Google Play.
