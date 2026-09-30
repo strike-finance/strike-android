@@ -1,0 +1,95 @@
+# Mirrors the APK Google Play serves for the live production release into a
+# GitHub release, so .../releases/latest/download/strike.apk is always current.
+name: Sync APK from Google Play
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # create releases
+  actions: write # keep the schedule enabled
+
+concurrency:
+  group: sync-apk
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: org.strikefinance.app
+  # Play app signing certificate on the universal APK (also in assetlinks.json).
+  SIGNING_CERT_SHA256: 1cbf83a9b6a2baa5cb9a319575ae3056b00c95f1e246662c7d7964401113a247
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r scripts/requirements.txt
+
+      - name: Find the live production version
+        id: play
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: python scripts/play_apk.py latest >> "$GITHUB_OUTPUT"
+
+      - name: Skip if that version is already released
+        id: known
+        run: |
+          code='${{ steps.play.outputs.version_code }}'
+          if gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -qx "v[^-]*-${code}"; then
+            echo "Version code ${code} is already released"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download the Play-signed universal APK
+        if: steps.known.outputs.released == 'false'
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: python scripts/play_apk.py download '${{ steps.play.outputs.version_code }}' strike.apk
+
+      - name: Verify package, version and signature
+        if: steps.known.outputs.released == 'false'
+        id: apk
+        run: |
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          badging=$("$bt/aapt2" dump badging strike.apk | head -1)
+          echo "$badging"
+          package=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$badging")
+          code=$(sed -n "s/.* versionCode='\([^']*\)'.*/\1/p" <<< "$badging")
+          name=$(sed -n "s/.* versionName='\([^']*\)'.*/\1/p" <<< "$badging")
+          [ "$package" = "$PACKAGE_NAME" ] || { echo "::error::package is $package"; exit 1; }
+          [ "$code" = '${{ steps.play.outputs.version_code }}' ] || { echo "::error::versionCode is $code"; exit 1; }
+          "$bt/apksigner" verify --print-certs strike.apk | tee certs.txt
+          grep -qi "Signer #1 certificate SHA-256 digest: ${SIGNING_CERT_SHA256}" certs.txt \
+            || { echo "::error::APK is not signed with the Play app signing key"; exit 1; }
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum strike.apk | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        if: steps.known.outputs.released == 'false'
+        run: |
+          gh release create "v${{ steps.apk.outputs.name }}-${{ steps.apk.outputs.code }}" strike.apk \
+            --title "Strike ${{ steps.apk.outputs.name }} (${{ steps.apk.outputs.code }})" \
+            --latest \
+            --notes "The same build that is live on Google Play, as a single APK for phones without Google Play.
+
+          - Version ${{ steps.apk.outputs.name }}, version code ${{ steps.apk.outputs.code }}
+          - Signing certificate SHA-256: \`${SIGNING_CERT_SHA256}\`
+          - File SHA-256: \`${{ steps.apk.outputs.sha256 }}\`"
+
+      # GitHub turns off schedules in public repos after 60 days without
+      # activity; re-enabling from the workflow itself resets that timer.
+      - name: Keep the schedule enabled
+        if: always()
+        run: gh workflow enable sync-apk.yml --repo "$GITHUB_REPOSITORY"
