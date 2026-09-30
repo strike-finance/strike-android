@@ -22,9 +22,19 @@ concurrency:
 
 env:
   PACKAGE_NAME: org.strikefinance.app
-  # Play app signing certificate on the universal APK (also in assetlinks.json).
+  # Play app signing certificate of the universal APK Play generates for us.
   SIGNING_CERT_SHA256: 1cbf83a9b6a2baa5cb9a319575ae3056b00c95f1e246662c7d7964401113a247
+  # Every signer in the APK must be one of Play's app signing keys: the original
+  # key, the upgraded classical key and the post-quantum key (all in assetlinks.json).
+  PLAY_SIGNING_CERTS: >-
+    1cbf83a9b6a2baa5cb9a319575ae3056b00c95f1e246662c7d7964401113a247
+    3a3699d23e130ca533dac7e28119583650280136c812ee65024e532300ffd62d
+    f1dcbc0161eeb1128892cc1b3f046f99dbe1eb8e1c51e15171d5f9533498bc28
   GH_TOKEN: ${{ github.token }}
+
+defaults:
+  run:
+    shell: bash # adds pipefail, so a failing command in a pipe fails the step
 
 jobs:
   sync:
@@ -71,6 +81,9 @@ jobs:
         id: apk
         run: |
           bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          # The upgraded Play key adds an ML-DSA (post-quantum) signer, which
+          # apksigner can only read on Java 24 or newer.
+          export JAVA_HOME="$JAVA_HOME_25_X64" PATH="$JAVA_HOME_25_X64/bin:$PATH"
           badging=$("$bt/aapt2" dump badging strike.apk | head -1)
           echo "$badging"
           package=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$badging")
@@ -79,8 +92,14 @@ jobs:
           [ "$package" = "$PACKAGE_NAME" ] || { echo "::error::package is $package"; exit 1; }
           [ "$code" = '${{ steps.play.outputs.version_code }}' ] || { echo "::error::versionCode is $code"; exit 1; }
           "$bt/apksigner" verify --print-certs strike.apk | tee certs.txt
-          grep -qi "Signer #1 certificate SHA-256 digest: ${SIGNING_CERT_SHA256}" certs.txt \
-            || { echo "::error::APK is not signed with the Play app signing key"; exit 1; }
+          signers=$(grep -v '^Source Stamp' certs.txt | sed -n 's/.*certificate SHA-256 digest: \([0-9a-f]*\).*/\1/p' | sort -u)
+          [ -n "$signers" ] || { echo "::error::apksigner printed no signing certificates"; exit 1; }
+          for cert in $signers; do
+            case " $PLAY_SIGNING_CERTS " in
+              *" $cert "*) echo "ok: signed with Play key $cert" ;;
+              *) echo "::error::APK has a signer that isn't a Play app signing key: $cert"; exit 1 ;;
+            esac
+          done
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "sha256=$(sha256sum strike.apk | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
